@@ -52,7 +52,8 @@ my $pgdata_default      = "/var/lib/pgsql/data";
 my $pghost_default      = "/tmp";
 my $pgport_default      = 5432;
 my $start_opts_default  = "";
-my $maxlag_default    = "0";
+my $maxlag_default      = "0";
+my $repslots_default    = "1";
 
 # Set default values if not found in environment
 my $system_user  = $ENV{'OCF_RESKEY_system_user'} || $system_user_default;
@@ -63,6 +64,7 @@ my $pghost       = $ENV{'OCF_RESKEY_pghost'} || $pghost_default;
 my $pgport       = $ENV{'OCF_RESKEY_pgport'} || $pgport_default;
 my $start_opts   = $ENV{'OCF_RESKEY_start_opts'} || $start_opts_default;
 my $maxlag       = $ENV{'OCF_RESKEY_maxlag'} || $maxlag_default;
+my $repslots     = $ENV{'OCF_RESKEY_repslots'} || $repslots_default;
 my $recovery_tpl = $ENV{'OCF_RESKEY_recovery_template'}
     || "$pgdata/recovery.conf.pcmk";
 
@@ -168,6 +170,54 @@ sub _query {
     #   2: unable to connect
     #   3: query failed
     return $rc;
+}
+
+# Clean existing replication slots
+# FIXME: add log, checks, etc.
+sub _clean_replication_slots {
+    my $query;
+    my $rc;
+    my @rs;
+
+    # Call crm_node to exclude nodes that are not part of the cluster at this
+    # point.
+    my @nodes = split /\s+/ => qx{ $CRM_NODE --list };
+
+    foreach my $node ( @nodes ) {
+        $query = "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '$node'";
+        ocf_log( 'debug', "repslot drop query: %s", $query );
+        $rc = _query( $query, \@rs );
+    }
+}
+
+# Create replication slots for each nodes of the cluster partition
+# FIXME: add log, checks, etc.
+# FIXME: take account that a repslot can be only alphanum lowercase and can contain _, nothing else.
+sub _create_replication_slots {
+    my $query;
+    my $rc;
+    my @rs;
+
+    my @partition_nodes = split /\s+/ => qx{ $CRM_NODE --partition };
+    my $thisnode = qx{ $CRM_NODE --name };
+
+    foreach my $node ( @partition_nodes ) {
+        next if ( $node eq $thisnode );
+        ocf_log( 'debug', "create replication slot for node %s", $node );
+	$query = "SELECT pg_create_physical_replication_slot('$node')";
+        ocf_log( 'debug', "repslot create query: %s", $query );
+	$rc = _query( $query, \@rs );
+        ocf_log( 'log', "replication slot for node %s created", $node );
+    }
+}
+
+# Make replication slots active
+sub _init_replication_slots {
+    # TODO !
+    # psql "replication=true dbname=replication host=192.168.2.87 port=5432 user=replicator application_name=ws-pgsql02-dz2" -c "IDENTIFY_SYSTEM;"
+    # CREATE_REPLICATION_SLOT slot_name PHYSICAL
+    # START_REPLICATION [SLOT slot_name] [PHYSICAL] XXX/XXX
+    ocf_log( 'log', "replication slot init not supported");
 }
 
 # Get the last received location on a standby
@@ -1680,6 +1730,9 @@ sub pgsql_demote {
     }
 
     # TODO we need to make sure at least one slave is connected!!
+    # TODO we also need to verify that each standby nodes are in sync
+    # before we destroy the replication slots.
+    _clean_replication_slots();
 
     # WARNING if the resource state is stopped instead of master, the ocf ra dev
     # rsc advises to return OCF_ERR_GENERIC, misleading the CRM in a loop where
@@ -1910,6 +1963,10 @@ sub pgsql_promote {
     }
 
     unless (
+        # create replication slots for all nodes
+        _create_replication_slots();
+        _init_replication_slots();
+
         # Promote the instance on the current node.
         _runas( $PGCTL, '--pgdata', $pgdata, '-w', 'promote' ) == 0 )
     {
